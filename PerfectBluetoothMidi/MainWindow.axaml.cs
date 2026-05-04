@@ -153,9 +153,8 @@ public partial class MainWindow : Window
 
         Opened  += async (_, _) =>
         {
-            // All the heavy WMS/SDK work is awaited via Task.Run so the
-            // window can paint and the user sees progress in the activity
-            // log instead of a frozen UI.
+            // Let the window show before the backend selection runs so the
+            // user sees progress in the activity log immediately.
             await DetectAndApplyBackendAsync();
 
             if (_activeBackend == "Loopback")
@@ -1107,18 +1106,13 @@ public partial class MainWindow : Window
     /// is left null so callers can detect the unavailable state.
     /// </summary>
     /// <remarks>
-    /// The actual <c>Open()</c> call is forced to a background thread —
-    /// WMS's <c>MidiVirtualDeviceManager.CreateVirtualDevice</c> is a
-    /// synchronous WinRT call that can block several seconds (especially
-    /// when a previous process just exited and the service hasn't yet
-    /// released the prior registration). Doing it on the UI thread freezes
-    /// the window.
-    ///
-    /// Also retries on null-return / open-failure with progressive backoff,
-    /// because that's the same race: the WMS service can briefly reject a
-    /// CreateVirtualDevice for a name that's still being unregistered from
-    /// a prior session. Three attempts with 0/600/1800 ms delays cover the
-    /// observed worst case in practice.
+    /// This stays on the UI thread for the same apartment/COM reason as the
+    /// bootstrap path. It can still block for a moment, but the window has
+    /// already loaded by the time this runs. Also retries on null-return /
+    /// open-failure with progressive backoff, because the WMS service can
+    /// briefly reject a CreateVirtualDevice for a name that's still being
+    /// unregistered from a prior session. Three attempts with 0/600/1800 ms
+    /// delays cover the observed worst case in practice.
     /// </remarks>
     private async Task EnsureVirtualEndpointOpenAsync()
     {
@@ -1140,16 +1134,15 @@ public partial class MainWindow : Window
 
             var ep = new WmsVirtualHostEndpoint(name);
             ep.Log += s => AppendLog($"[virtual] {s}");
-            bool opened = await Task.Run(() => ep.Open()).ConfigureAwait(true);
+            bool opened = ep.Open();
             if (opened)
             {
                 _virtualEndpoint = ep;
                 return;
             }
             // Open() already logged the specific failure cause; dispose the
-            // half-built endpoint off the UI thread too — Dispose can also
-            // make synchronous WMS calls.
-            await Task.Run(() => { try { ep.Dispose(); } catch { } }).ConfigureAwait(true);
+            // half-built endpoint here as well.
+            try { ep.Dispose(); } catch { }
         }
 
         AppendLog($"Could not create virtual MIDI port '{name}' after {delaysMs.Length} attempts. " +
@@ -1159,29 +1152,31 @@ public partial class MainWindow : Window
     /// <summary>
     /// Dispose the long-lived virtual endpoint if any. Called when leaving
     /// Virtual mode, when re-creating under a new name, and on app exit.
-    /// Run off the UI thread because WMS dispose / DisconnectEndpointConnection
-    /// can also be synchronous and slow.
+    /// Kept on the UI thread for the same reason as WMS bootstrap: the
+    /// desktop STA already has COM initialized, and these calls are short.
     /// </summary>
-    private async Task CloseVirtualEndpointAsync()
+    private Task CloseVirtualEndpointAsync()
     {
         var ep = _virtualEndpoint;
-        if (ep is null) return;
+        if (ep is null) return Task.CompletedTask;
         _virtualEndpoint = null;
-        await Task.Run(() => { try { ep.Dispose(); } catch { } }).ConfigureAwait(true);
+        try { ep.Dispose(); } catch { }
+        return Task.CompletedTask;
     }
 
     /// <summary>
     /// Synchronous best-effort dispose for shutdown paths
     /// (<see cref="QuitApplicationAsync"/>) that don't await per-step.
-    /// Fires Dispose on the thread pool and doesn't wait — the OS will
-    /// reclaim WMS handles when the process exits anyway.
+    /// Fires Dispose immediately on the UI thread. The shutdown path
+    /// already happens after BLE teardown, so this stays simple and keeps
+    /// the COM apartment consistent.
     /// </summary>
     private void CloseVirtualEndpoint()
     {
         var ep = _virtualEndpoint;
         if (ep is null) return;
         _virtualEndpoint = null;
-        _ = Task.Run(() => { try { ep.Dispose(); } catch { } });
+        try { ep.Dispose(); } catch { }
     }
 
     // ===================================================================
@@ -1290,26 +1285,23 @@ public partial class MainWindow : Window
     /// <see cref="SwitchBackendAsync"/>.
     /// </summary>
     /// <remarks>
-    /// All WMS calls (SDK init + virtual-device open) are forced to a
-    /// background thread so they don't block the UI thread — they can each
-    /// take several seconds, especially the first time after a previous
-    /// process exited (the WMS service needs a moment to clean up the
-    /// prior endpoint registration before a new one with the same name
-    /// can be registered). We probe the SDK runtime regardless of the
-    /// saved preference (even when pinned to "Loopback"), because the
-    /// affordance we show inside the loopback panel depends on whether
-    /// the SDK is actually available.
+    /// We probe the SDK runtime regardless of the saved preference (even
+    /// when pinned to "Loopback"), because the affordance we show inside
+    /// the loopback panel depends on whether the SDK is actually available.
     /// </remarks>
     private async Task DetectAndApplyBackendAsync()
     {
         var prefs = AppSettingsStore.Load();
         string preferred = prefs.HostBackend ?? "Auto";
 
-        // Heavy: WMS SDK runtime initialisation. First call loads the
-        // runtime DLLs and brings the service into a working state — can
-        // take 100ms-2s. Move off UI thread.
-        bool wmsAvailable = await Task.Run(() => WmsRuntime.EnsureInitialized(AppendLog))
-                                      .ConfigureAwait(true);
+        // Let the window finish painting before the first WMS call runs on
+        // the UI thread.
+        await Task.Yield();
+
+        // Keep WMS bootstrap on the desktop STA thread. The bootstrapper
+        // requires COM to be initialized on the calling thread, and the
+        // Avalonia UI thread satisfies that requirement.
+        bool wmsAvailable = WmsRuntime.EnsureInitialized(AppendLog);
 
         if (preferred == "Loopback")
         {

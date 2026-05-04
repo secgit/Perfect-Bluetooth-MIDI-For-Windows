@@ -37,16 +37,12 @@
     <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
     <DebugType>embedded</DebugType>
 
-    <!-- Trim the Windows SDK projections (Microsoft.Windows.SDK.NET.dll is
-         ~26 MB uncompressed on disk — it projects the ENTIRE Windows 10/11
-         WinRT surface) down to just the types/members we actually call.
-         TrimMode "partial" leaves our own assemblies and Avalonia alone
-         (both use reflection in places the linker can't fully prove safe),
-         and only trims assemblies that opt in — in practice the SDK
-         projection, which IS trim-safe. Net effect on this project: roughly
-         halves the single-file exe. -->
-    <PublishTrimmed>true</PublishTrimmed>
-    <TrimMode>partial</TrimMode>
+    <!-- Trimming was causing a native startup crash in the published
+         single-file build (BEX64 / 0xc0000409). The app uses Avalonia, WinRT,
+         and Windows MIDI Services COM/bootstrap code that is not trim-safe
+         enough for release publishing here, so keep the published exe
+         untrimmed for reliability. -->
+    <PublishTrimmed>false</PublishTrimmed>
   </PropertyGroup>
 
   <ItemGroup>
